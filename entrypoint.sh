@@ -48,6 +48,27 @@ case "$role" in
         ;;
     rcs)
         cd /opt/jz/rcs
+        # rcsctl keeps its database (rcs.config) and its logs/ in the WORKING
+        # DIRECTORY, not under an absolute path. Verified by starting it in an
+        # empty directory: both appeared there. Spaces go to the absolute
+        # /opt/jz/rcs/spaces, which the chart mounts on its own.
+        #
+        # Changing the working directory instead would move whatever else it
+        # resolves relative to /opt/jz/rcs when it launches jzrouter and
+        # libmrpc, so the cwd stays put and the two paths are linked into
+        # persistent storage. A first boot moves the image's copies across.
+        if [ -n "${RCS_STATE_DIR:-}" ]; then
+            mkdir -p "$RCS_STATE_DIR"
+            for entry in rcs.config logs; do
+                if [ -e "$entry" ] && [ ! -L "$entry" ]; then
+                    [ -e "$RCS_STATE_DIR/$entry" ] || mv "$entry" "$RCS_STATE_DIR/$entry"
+                    rm -rf "$entry"
+                fi
+                ln -sfn "$RCS_STATE_DIR/$entry" "$entry"
+            done
+            mkdir -p "$RCS_STATE_DIR/logs"
+            echo "rcsctl state in $RCS_STATE_DIR"
+        fi
         exec ./rcsctl -p "${RCS_PORT:-10000}" "$@"
         ;;
     *)

@@ -88,7 +88,7 @@ jobs:
             -e INFLUXDB_BIND_ADDRESS=127.0.0.1:8098 \
             docker.io/library/influxdb:1.8
           podman run -d --pod smoke --name server "$IMG" server
-          podman run -d --pod smoke --name rcs "$IMG" rcs
+          podman run -d --pod smoke --name rcs -e RCS_STATE_DIR=/tmp/rcs-state "$IMG" rcs
 
           ok=""
           for i in $(seq 1 90); do
