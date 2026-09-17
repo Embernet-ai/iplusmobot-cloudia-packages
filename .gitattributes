@@ -1,0 +1,5 @@
+# entrypoint.sh runs as the image ENTRYPOINT. If it ever lands in the repo with
+# CRLF endings, the kernel reads the shebang as "/bin/bash\r" and every
+# container dies with "bad interpreter: no such file or directory".
+*.sh text eol=lf
+Containerfile* text eol=lf
