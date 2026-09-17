@@ -97,12 +97,19 @@ jobs:
             fi
             sleep 2
           done
-          podman logs server | tail -40
-          podman logs rcs | tail -10
+          # Captured, not piped into grep -q. Under pipefail, grep -q exits on the
+          # first match, podman logs takes SIGPIPE, and the pipeline reports a
+          # failure for a migration that succeeded. That is exactly what the
+          # first CI run did.
+          server_log=$(podman logs server 2>&1)
+          printf '%s\n' "$server_log" | tail -40
+          podman logs rcs 2>&1 | tail -10
           [ -n "$ok" ] || { echo "::error::Cloudia ports never all came up"; exit 1; }
 
-          podman logs server 2>&1 | grep -q 'Migrate mysql ok' \
-            || { echo "::error::schema migration did not report ok"; exit 1; }
+          case "$server_log" in
+            *'Migrate mysql ok'*) echo "schema migration ok" ;;
+            *) echo "::error::schema migration did not report ok"; exit 1 ;;
+          esac
 
           for p in 9000 9669 10000; do
             code=$(podman exec server curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p/")
@@ -112,11 +119,13 @@ jobs:
 
           # The databases must never be reachable off-host. With hostNetwork in
           # the chart, anything on a wildcard address is on the plant LAN.
-          podman exec server ss -ltnH | awk '{print $4}' \
-            | grep -E ':(3306|6379|8086|8098)$' | grep -v '^127\.0\.0\.1:' \
-            && { echo "::error::a database is listening on a non-loopback address"; exit 1; } || true
-          podman exec server ss -ltnH | awk '{print $4}' | grep -q ':8088$' \
-            && { echo "::error::something took 8088, which is Ignition Edge's port"; exit 1; } || true
+          listeners=$(podman exec server ss -ltnH | awk '{print $4}')
+          printf '%s\n' "$listeners"
+          exposed=$(printf '%s\n' "$listeners" | grep -E ':(3306|6379|8086|8098)$' | grep -v '^127\.0\.0\.1:' || true)
+          [ -z "$exposed" ] || { echo "::error::database listening off loopback: $exposed"; exit 1; }
+          case "$listeners" in
+            *:8088*) echo "::error::something took 8088, which is Ignition Edge's port"; exit 1 ;;
+          esac
 
           # rcsctl reads the router version with dpkg -s. Create a space and
           # apply it (the apply is refused for lack of a map, which is fine)
