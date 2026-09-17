@@ -1,0 +1,139 @@
+name: Build Cloudia Container (amd64)
+
+# x86-64 only. IPLUSMOBOT ships Cloudia, jzrouter, libmrpc and rcsctl for amd64
+# and nothing else, so there is no arm64 leg to build.
+#
+# The smoke test runs the image the way the chart does: one pod, MySQL / Redis /
+# InfluxDB sidecars bound to loopback, the server role and the rcs role. A layout
+# check alone would pass an image whose migration or services never come up,
+# which is the failure that actually matters.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'Containerfile'
+      - 'entrypoint.sh'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'Containerfile'
+      - 'entrypoint.sh'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      cloudia_version:
+        description: 'Cloudia version (release tag without leading v)'
+        required: true
+        default: '2.1.19-34'
+
+concurrency:
+  group: cloudia-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 45
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: embernet-ai/iplusmobot-cloudia
+      CLOUDIA_VERSION: ${{ github.event.inputs.cloudia_version || '2.1.19-34' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Login to ghcr.io
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | podman login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Build amd64 image
+        run: |
+          podman build \
+            --platform linux/amd64 \
+            --build-arg CLOUDIA_VERSION="${CLOUDIA_VERSION}" \
+            -t "${REGISTRY}/${IMAGE_NAME}:build" \
+            -f Containerfile .
+          podman images "${REGISTRY}/${IMAGE_NAME}:build" \
+            --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
+
+      - name: Smoke test (the pod the chart runs)
+        run: |
+          set -euo pipefail
+          IMG="${REGISTRY}/${IMAGE_NAME}:build"
+          podman pod create --name smoke
+          podman run -d --pod smoke --name mysql \
+            -e MYSQL_ROOT_PASSWORD=123456 -e MYSQL_DATABASE=jzrobot \
+            docker.io/library/mysql:5.7 \
+            --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci \
+            --bind-address=127.0.0.1
+          podman run -d --pod smoke --name redis docker.io/library/redis:6.2 \
+            redis-server --bind 127.0.0.1 --protected-mode yes
+          podman run -d --pod smoke --name influxdb \
+            -e INFLUXDB_DB=jzrobot \
+            -e INFLUXDB_HTTP_BIND_ADDRESS=127.0.0.1:8086 \
+            -e INFLUXDB_BIND_ADDRESS=127.0.0.1:8098 \
+            docker.io/library/influxdb:1.8
+          podman run -d --pod smoke --name server "$IMG" server
+          podman run -d --pod smoke --name rcs "$IMG" rcs
+
+          ok=""
+          for i in $(seq 1 90); do
+            if podman exec server bash -c 'for p in 9000 9669 8800 8858 8848 16666 17778 10000; do nc -z 127.0.0.1 $p || exit 1; done'; then
+              ok=1; break
+            fi
+            sleep 2
+          done
+          podman logs server | tail -40
+          podman logs rcs | tail -10
+          [ -n "$ok" ] || { echo "::error::Cloudia ports never all came up"; exit 1; }
+
+          podman logs server 2>&1 | grep -q 'Migrate mysql ok' \
+            || { echo "::error::schema migration did not report ok"; exit 1; }
+
+          for p in 9000 9669 10000; do
+            code=$(podman exec server curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p/")
+            echo "http :$p -> $code"
+            [ "$code" = 200 ] || { echo "::error::port $p answered $code"; exit 1; }
+          done
+
+          # The databases must never be reachable off-host. With hostNetwork in
+          # the chart, anything on a wildcard address is on the plant LAN.
+          podman exec server ss -ltnH | awk '{print $4}' \
+            | grep -E ':(3306|6379|8086|8098)$' | grep -v '^127\.0\.0\.1:' \
+            && { echo "::error::a database is listening on a non-loopback address"; exit 1; } || true
+          podman exec server ss -ltnH | awk '{print $4}' | grep -q ':8088$' \
+            && { echo "::error::something took 8088, which is Ignition Edge's port"; exit 1; } || true
+
+          # rcsctl reads the router version with dpkg -s. Create a space and
+          # apply it (the apply is refused for lack of a map, which is fine)
+          # just to make rcsctl go and read the version.
+          podman exec rcs curl -s -X POST -H 'Content-Type: application/json' \
+            -d '{"name":"smoke"}' http://127.0.0.1:10000/api/space/add
+          podman exec rcs curl -s -X POST 'http://127.0.0.1:10000/api/space/config_apply?name=smoke' || true
+          podman exec rcs grep -q 'got jzrouter version: 2\.' /opt/jz/rcs/logs/rcsctl.log \
+            || { echo "::error::rcsctl could not read the jzrouter version"; podman exec rcs tail -20 /opt/jz/rcs/logs/rcsctl.log; exit 1; }
+          echo "smoke test passed"
+
+      - name: Tag + push (:version, :latest, :main)
+        if: github.event_name != 'pull_request'
+        run: |
+          for TAG in "${CLOUDIA_VERSION}" latest main; do
+            REF="${REGISTRY}/${IMAGE_NAME}:${TAG}"
+            podman tag "${REGISTRY}/${IMAGE_NAME}:build" "${REF}"
+            podman push "${REF}" "docker://${REF}"
+            echo "Pushed: ${REF}"
+          done
