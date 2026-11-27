@@ -2,6 +2,8 @@
 
 IPLUSMOBOT Cloudia, the AMR monitor and dispatch server, packaged as a container for EmberNET edge nodes.
 
+Part of [EmberNet](https://embernet.ai), the complete industrial edge platform.
+
 The chart that deploys it lives in [iplusmobot-cloudia-helm](https://github.com/Embernet-ai/iplusmobot-cloudia-helm).
 
 ## Releases
